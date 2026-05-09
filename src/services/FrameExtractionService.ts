@@ -6,10 +6,16 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import path from 'path';
 import fs from 'fs';
-import { ensureDirectoryExists, removeDirectory } from '../utils/cleanup';
+import { ensureDirectoryExists } from '../utils/cleanup';
+
+const ffprobeStatic: { path?: string } = require('ffprobe-static');
 
 if (ffmpegStatic) {
   ffmpeg.setFfmpegPath(ffmpegStatic);
+}
+
+if (ffprobeStatic?.path) {
+  ffmpeg.setFfprobePath(ffprobeStatic.path);
 }
 
 export interface VideoInfo {
@@ -32,6 +38,23 @@ export interface ExtractedFrame {
 }
 
 export class FrameExtractionService {
+  private static parseFps(rate?: string): number {
+    if (!rate) {
+      return 30;
+    }
+
+    const [numerator, denominator] = rate.split('/').map(Number);
+    if (!Number.isFinite(numerator) || numerator <= 0) {
+      return 30;
+    }
+
+    if (!Number.isFinite(denominator) || denominator <= 0) {
+      return numerator;
+    }
+
+    return numerator / denominator;
+  }
+
   /**
    * Get video metadata (fps, duration, frame count)
    */
@@ -49,7 +72,7 @@ export class FrameExtractionService {
             throw new Error('No video stream found');
           }
 
-          const fps = stream.r_frame_rate ? eval(stream.r_frame_rate) : 30;
+          const fps = this.parseFps(stream.r_frame_rate);
           const duration = metadata.format.duration || 0;
           const durationMs = Math.round(duration * 1000);
           const totalFramesEstimated = Math.round(duration * fps);
@@ -77,83 +100,56 @@ export class FrameExtractionService {
     await ensureDirectoryExists(options.outputDir);
 
     const videoInfo = await this.getVideoInfo(videoPath);
-    const frameDurationMs = 1000 / videoInfo.fps;
-    const frameInterval = Math.max(1, Math.round(options.sampleIntervalMs / frameDurationMs));
+    const outputPattern = path.join(options.outputDir, 'frame_%06d.png');
+    const frameRate = 1000 / options.sampleIntervalMs;
 
     return new Promise((resolve, reject) => {
-      let frameCount = 0;
-      let extractedFrames: ExtractedFrame[] = [];
+      const stderrLines: string[] = [];
 
       ffmpeg(videoPath)
-        .on('filenames', (filenames) => {
-          // Not used in this case, we handle frame numbering
+        .outputOptions([
+          '-vf',
+          `fps=${frameRate}`,
+          '-start_number',
+          '0',
+        ])
+        .output(outputPattern)
+        .on('stderr', (line) => {
+          stderrLines.push(line);
         })
         .on('end', () => {
-          resolve(extractedFrames);
-        })
-        .on('error', (err) => {
-          reject(new Error(`Frame extraction failed: ${err.message}`));
-        })
-        .screenshots({
-          count: Math.ceil(videoInfo.durationMs / options.sampleIntervalMs),
-          folder: options.outputDir,
-          filename: 'frame_%i.png',
-          timestamps: this.generateTimestamps(videoInfo.durationMs, options.sampleIntervalMs),
-        });
+          try {
+            const files = fs.readdirSync(options.outputDir)
+              .filter((f) => f.startsWith('frame_') && f.endsWith('.png'))
+              .sort((a, b) => {
+                const numA = parseInt(a.match(/\d+/)?.[0] || '0');
+                const numB = parseInt(b.match(/\d+/)?.[0] || '0');
+                return numA - numB;
+              });
 
-      // Track extracted frames
-      const trackFrames = () => {
-        try {
-          const files = fs.readdirSync(options.outputDir)
-            .filter((f) => f.startsWith('frame_') && f.endsWith('.png'))
-            .sort((a, b) => {
-              const numA = parseInt(a.match(/\d+/)?.[0] || '0');
-              const numB = parseInt(b.match(/\d+/)?.[0] || '0');
-              return numA - numB;
+            const extractedFrames = files.map((filename, index) => {
+              const framePath = path.join(options.outputDir, filename);
+              const timestampMs = Math.min(index * options.sampleIntervalMs, videoInfo.durationMs);
+              return {
+                frameIndex: index,
+                frameNumber: index,
+                timestampMs,
+                framePath,
+              };
             });
 
-          extractedFrames = files.map((filename, index) => {
-            const framePath = path.join(options.outputDir, filename);
-            const timestampMs = index * options.sampleIntervalMs;
-            return {
-              frameIndex: index,
-              frameNumber: index,
-              timestampMs,
-              framePath,
-            };
-          });
-        } catch (error) {
-          console.error('Error tracking frames:', error);
-        }
-      };
-
-      // Check for frames periodically
-      const checkInterval = setInterval(() => {
-        trackFrames();
-        if (extractedFrames.length > frameCount) {
-          frameCount = extractedFrames.length;
-        }
-      }, 500);
-
-      // Clean up interval on completion
-      setTimeout(() => {
-        clearInterval(checkInterval);
-      }, videoInfo.durationMs + 5000);
+            resolve(extractedFrames);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            reject(new Error(`Frame extraction failed while reading extracted frames: ${message}`));
+          }
+        })
+        .on('error', (err) => {
+          const stderr = stderrLines.slice(-20).join('\n').trim();
+          const details = stderr ? `${err.message}\n${stderr}` : err.message;
+          reject(new Error(`Frame extraction failed: ${details}`));
+        })
+        .run();
     });
-  }
-
-  /**
-   * Generate timestamps for frame extraction (in seconds)
-   */
-  private static generateTimestamps(durationMs: number, intervalMs: number): number[] {
-    const timestamps: number[] = [];
-    const durationSec = durationMs / 1000;
-    const intervalSec = intervalMs / 1000;
-
-    for (let i = 0; i < durationSec; i += intervalSec) {
-      timestamps.push(i);
-    }
-
-    return timestamps;
   }
 }

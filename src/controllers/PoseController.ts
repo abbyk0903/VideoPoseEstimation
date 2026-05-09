@@ -113,6 +113,11 @@ export class PoseController {
 
           frameDataList.push(frameData);
         } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage.includes('MediaPipe runtime failed')) {
+            throw error;
+          }
+
           console.error(`Error processing frame ${frame.frameIndex}:`, error);
           warnings.push(`Failed to process frame ${frame.frameIndex}`);
         }
@@ -132,6 +137,21 @@ export class PoseController {
 
       if (!personDetected) {
         warnings.push('No person detected in most frames');
+      }
+
+      if (frameDataList.length === 0 || !personDetected) {
+        res.status(422).json({
+          error: 'Pose detection failed',
+          details: warnings,
+          metadata: {
+            fps: videoInfo.fps,
+            durationMs: videoInfo.durationMs,
+            totalFramesInVideo: videoInfo.totalFramesEstimated,
+            sampledFrameCount: frameDataList.length,
+            extractedFrameCount: extractedFrames.length,
+          },
+        });
+        return;
       }
 
       const quality: QualityMetrics = {
@@ -196,6 +216,11 @@ export class PoseController {
         res.status(400).json({ error: 'Invalid video file format' });
       } else if (errorMessage.includes('extraction')) {
         res.status(500).json({ error: 'Frame extraction failed' });
+      } else if (errorMessage.includes('MediaPipe runtime failed')) {
+        res.status(500).json({
+          error: 'Pose estimation runtime failed',
+          details: errorMessage,
+        });
       } else if (errorMessage.includes('MediaPipe')) {
         res.status(500).json({ error: 'Pose estimation service initialization failed' });
       } else {

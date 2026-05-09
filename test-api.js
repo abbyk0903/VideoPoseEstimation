@@ -15,7 +15,7 @@ const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 
-const API_BASE_URL = process.env.API_URL || 'http://localhost:5000';
+const API_BASE_URL = process.env.API_URL || 'http://localhost:4000';
 
 async function testHealthCheck() {
   console.log('\n=== Testing Health Check ===');

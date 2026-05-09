@@ -17,10 +17,11 @@ export class LlmExerciseEvaluationService {
     }
 
     const model = config.groqModel || 'llama-3.1-8b-instant';
-    const url = `https://api.groq.com/v1/llms/${encodeURIComponent(model)}/chat/completions`;
+    const url = 'https://api.groq.com/openai/v1/chat/completions';
     const prompt = ExerciseEvaluationPromptBuilder.buildPrompt(exerciseType, movementSummary);
 
     const payload = {
+      model,
       messages: [
         {
           role: 'system',
@@ -32,7 +33,7 @@ export class LlmExerciseEvaluationService {
         },
       ],
       temperature: 0.2,
-      max_output_tokens: 800,
+      max_tokens: 1200,
     };
 
     const response = await fetch(url, {
@@ -70,7 +71,7 @@ export class LlmExerciseEvaluationService {
       }
     }
 
-    if (typeof response.choices === 'object') {
+    if (Array.isArray(response.choices)) {
       const firstChoice = response.choices[0];
       if (firstChoice?.message?.content) {
         return firstChoice.message.content;

@@ -1,12 +1,18 @@
 /**
- * MediaPipePoseEstimationService - Run pose estimation on frames
+ * MediaPipePoseEstimationService - Run pose estimation on frames.
+ *
+ * @mediapipe/tasks-vision is browser-first and needs a real WebGL runtime when
+ * converting image frames. The Node API keeps the rest of the service simple,
+ * but actual pose inference runs in a reusable headless Chrome page.
  */
 
-import {
-  PoseLandmarker,
-  FilesetResolver,
-} from '@mediapipe/tasks-vision';
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import * as fs from 'fs';
+import * as http from 'http';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { Landmark, LandmarkName, FrameData } from '../models/PoseTypes';
 import { calculateAverageVisibility } from '../utils/math';
 
@@ -47,49 +53,509 @@ const LANDMARK_NAMES: Array<LandmarkName | null> = [
   'rightFootIndex', // 32
 ];
 
+type BrowserLandmark = {
+  x: number;
+  y: number;
+  z?: number;
+  visibility?: number;
+};
+
+type CdpResponse = {
+  id?: number;
+  result?: any;
+  error?: { message: string; data?: string };
+  method?: string;
+  params?: any;
+};
+
+class CdpClient {
+  private ws: WebSocket | null = null;
+  private nextId = 1;
+  private pending = new Map<number, {
+    resolve: (value: any) => void;
+    reject: (error: Error) => void;
+  }>();
+  private eventWaiters = new Map<string, Array<(params: any) => void>>();
+
+  async connect(webSocketUrl: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(webSocketUrl);
+      this.ws = ws;
+
+      ws.addEventListener('open', () => resolve(), { once: true });
+      ws.addEventListener('error', () => reject(new Error('Failed to connect to Chrome DevTools')), { once: true });
+      ws.addEventListener('message', (event) => this.handleMessage(event.data));
+      ws.addEventListener('close', () => {
+        for (const { reject } of this.pending.values()) {
+          reject(new Error('Chrome DevTools connection closed'));
+        }
+        this.pending.clear();
+      });
+    });
+  }
+
+  send(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('Chrome DevTools is not connected'));
+    }
+
+    const id = this.nextId++;
+    const message = JSON.stringify({ id, method, params });
+    const promise = new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+    });
+
+    this.ws.send(message);
+    return promise;
+  }
+
+  waitForEvent(method: string, timeoutMs = 15000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const waiters = this.eventWaiters.get(method) || [];
+        this.eventWaiters.set(method, waiters.filter((waiter) => waiter !== finish));
+        reject(new Error(`Timed out waiting for Chrome event ${method}`));
+      }, timeoutMs);
+
+      const finish = (params: any) => {
+        clearTimeout(timer);
+        resolve(params);
+      };
+
+      const waiters = this.eventWaiters.get(method) || [];
+      waiters.push(finish);
+      this.eventWaiters.set(method, waiters);
+    });
+  }
+
+  async evaluate(expression: string): Promise<any> {
+    const result = await this.send('Runtime.evaluate', {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+
+    if (result.exceptionDetails) {
+      const details = result.exceptionDetails;
+      const message = details.exception?.description || details.text || 'Browser evaluation failed';
+      throw new Error(message);
+    }
+
+    return result.result?.value;
+  }
+
+  close(): void {
+    this.ws?.close();
+    this.ws = null;
+  }
+
+  private handleMessage(data: unknown): void {
+    const text = typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer).toString('utf8');
+    const message = JSON.parse(text) as CdpResponse;
+
+    if (message.id) {
+      const pending = this.pending.get(message.id);
+      if (!pending) {
+        return;
+      }
+
+      this.pending.delete(message.id);
+      if (message.error) {
+        pending.reject(new Error(message.error.data || message.error.message));
+      } else {
+        pending.resolve(message.result);
+      }
+      return;
+    }
+
+    if (message.method) {
+      const waiters = this.eventWaiters.get(message.method) || [];
+      this.eventWaiters.delete(message.method);
+      waiters.forEach((waiter) => waiter(message.params));
+    }
+  }
+}
+
+class BrowserPoseRuntime {
+  private static readonly defaultModelUrl =
+    'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+  private chrome: ChildProcessWithoutNullStreams | null = null;
+  private cdp: CdpClient | null = null;
+  private server: http.Server | null = null;
+  private serverPort = 0;
+  private chromeDebugPort = 0;
+  private chromeUserDataDir = '';
+  private readonly frameFiles = new Map<string, string>();
+
+  async start(): Promise<void> {
+    this.serverPort = await this.getFreePort();
+    this.chromeDebugPort = await this.getFreePort();
+    this.chromeUserDataDir = path.join(os.tmpdir(), `mediapipe-chrome-${randomUUID()}`);
+
+    await this.startServer();
+    await this.startChrome();
+    await this.openRunnerPage();
+  }
+
+  async detect(imagePath: string): Promise<BrowserLandmark[]> {
+    if (!this.cdp) {
+      throw new Error('Browser pose runtime is not initialized');
+    }
+
+    const frameId = randomUUID();
+    this.frameFiles.set(frameId, path.resolve(imagePath));
+
+    try {
+      const frameUrl = `http://127.0.0.1:${this.serverPort}/frame/${frameId}`;
+      return await this.cdp.evaluate(`window.poseRuntime.detect(${JSON.stringify(frameUrl)})`);
+    } finally {
+      this.frameFiles.delete(frameId);
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.cdp?.close();
+    this.cdp = null;
+
+    if (this.chrome) {
+      this.chrome.kill();
+      this.chrome = null;
+    }
+
+    if (this.server) {
+      await new Promise<void>((resolve) => this.server?.close(() => resolve()));
+      this.server = null;
+    }
+
+    if (this.chromeUserDataDir) {
+      fs.rm(this.chromeUserDataDir, { recursive: true, force: true }, () => undefined);
+      this.chromeUserDataDir = '';
+    }
+  }
+
+  private async startServer(): Promise<void> {
+    this.server = http.createServer((req, res) => this.handleRequest(req, res));
+
+    await new Promise<void>((resolve, reject) => {
+      this.server?.once('error', reject);
+      this.server?.listen(this.serverPort, '127.0.0.1', () => resolve());
+    });
+  }
+
+  private async startChrome(): Promise<void> {
+    const chromePath = this.getChromePath();
+    const runnerUrl = `http://127.0.0.1:${this.serverPort}/runner`;
+
+    this.chrome = spawn(chromePath, [
+      '--headless=new',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      '--disable-client-side-phishing-detection',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-domain-reliability',
+      '--disable-extensions',
+      '--disable-sync',
+      '--disable-features=MediaRouter,OptimizationHints,PushMessaging',
+      '--enable-webgl',
+      '--ignore-gpu-blocklist',
+      '--use-gl=angle',
+      '--use-angle=swiftshader',
+      '--enable-unsafe-swiftshader',
+      `--remote-debugging-port=${this.chromeDebugPort}`,
+      `--user-data-dir=${this.chromeUserDataDir}`,
+      runnerUrl,
+    ], {
+      windowsHide: true,
+    });
+
+    this.chrome.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      if (this.shouldLogChromeStderr(text)) {
+        console.warn(text.trim());
+      }
+    });
+
+    await this.waitForChrome();
+  }
+
+  private async openRunnerPage(): Promise<void> {
+    const target = await this.createChromeTarget(`http://127.0.0.1:${this.serverPort}/runner`);
+    this.cdp = new CdpClient();
+    await this.cdp.connect(target.webSocketDebuggerUrl);
+    await this.cdp.send('Runtime.enable');
+    await this.cdp.send('Page.enable');
+
+    const loadEvent = this.cdp.waitForEvent('Page.loadEventFired');
+    await this.cdp.send('Page.navigate', { url: `http://127.0.0.1:${this.serverPort}/runner` });
+    await loadEvent;
+
+    await this.waitForPoseRuntime();
+
+    const modelPath = process.env.MEDIAPIPE_POSE_MODEL_PATH?.trim();
+    const modelUrl = modelPath
+      ? `http://127.0.0.1:${this.serverPort}/model`
+      : BrowserPoseRuntime.defaultModelUrl;
+
+    await this.cdp.evaluate(`window.poseRuntime.initialize({
+      wasmBaseUrl: ${JSON.stringify(`http://127.0.0.1:${this.serverPort}/wasm`)},
+      modelUrl: ${JSON.stringify(modelUrl)}
+    })`);
+  }
+
+  private async waitForPoseRuntime(): Promise<void> {
+    if (!this.cdp) {
+      throw new Error('Chrome DevTools is not connected');
+    }
+
+    const started = Date.now();
+    while (Date.now() - started < 15000) {
+      const ready = await this.cdp.evaluate('Boolean(window.poseRuntime)');
+      if (ready) {
+        return;
+      }
+      await this.delay(250);
+    }
+
+    throw new Error('Timed out waiting for MediaPipe browser runner');
+  }
+
+  private async createChromeTarget(url: string): Promise<{ webSocketDebuggerUrl: string }> {
+    const endpoint = `http://127.0.0.1:${this.chromeDebugPort}/json/new?${encodeURIComponent(url)}`;
+    let response = await fetch(endpoint, { method: 'PUT' });
+    if (!response.ok) {
+      response = await fetch(endpoint);
+    }
+
+    if (!response.ok) {
+      throw new Error(`Failed to create Chrome target: ${response.status} ${await response.text()}`);
+    }
+
+    return response.json() as Promise<{ webSocketDebuggerUrl: string }>;
+  }
+
+  private async waitForChrome(): Promise<void> {
+    const endpoint = `http://127.0.0.1:${this.chromeDebugPort}/json/version`;
+    const started = Date.now();
+
+    while (Date.now() - started < 15000) {
+      if (this.chrome?.exitCode !== null) {
+        throw new Error(`Chrome exited before DevTools became available with code ${this.chrome?.exitCode}`);
+      }
+
+      try {
+        const response = await fetch(endpoint);
+        if (response.ok) {
+          return;
+        }
+      } catch {
+        // Chrome is still starting.
+      }
+
+      await this.delay(250);
+    }
+
+    throw new Error('Timed out waiting for Chrome DevTools');
+  }
+
+  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const url = new URL(req.url || '/', `http://127.0.0.1:${this.serverPort}`);
+
+    try {
+      if (url.pathname === '/runner') {
+        this.sendText(res, 'text/html', this.getRunnerHtml());
+        return;
+      }
+
+      if (url.pathname === '/vision_bundle.mjs') {
+        this.sendFile(res, path.join(path.dirname(require.resolve('@mediapipe/tasks-vision')), 'vision_bundle.mjs'), 'text/javascript');
+        return;
+      }
+
+      if (url.pathname.startsWith('/wasm/')) {
+        const filename = path.basename(url.pathname);
+        this.sendFile(
+          res,
+          path.join(path.dirname(require.resolve('@mediapipe/tasks-vision')), 'wasm', filename),
+          filename.endsWith('.wasm') ? 'application/wasm' : 'text/javascript'
+        );
+        return;
+      }
+
+      if (url.pathname === '/model') {
+        const modelPath = process.env.MEDIAPIPE_POSE_MODEL_PATH?.trim();
+        if (!modelPath) {
+          this.notFound(res);
+          return;
+        }
+        this.sendFile(res, path.resolve(modelPath), 'application/octet-stream');
+        return;
+      }
+
+      if (url.pathname.startsWith('/frame/')) {
+        const frameId = path.basename(url.pathname);
+        const framePath = this.frameFiles.get(frameId);
+        if (!framePath) {
+          this.notFound(res);
+          return;
+        }
+        this.sendFile(res, framePath, 'image/png');
+        return;
+      }
+
+      this.notFound(res);
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private getRunnerHtml(): string {
+    return `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>MediaPipe Pose Runner</title></head>
+<body>
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from '/vision_bundle.mjs';
+
+let poseLandmarker = null;
+
+window.importScripts = () => {
+  throw new TypeError('Use dynamic import for MediaPipe WASM modules');
+};
+window.import = async (moduleUrl) => {
+  const wasmModule = await import(moduleUrl);
+  window.ModuleFactory = wasmModule.default || wasmModule;
+};
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = 'anonymous';
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Failed to load frame image'));
+    image.src = url;
+  });
+}
+
+window.poseRuntime = {
+  async initialize(config) {
+    const vision = await FilesetResolver.forVisionTasks(config.wasmBaseUrl, true);
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: config.modelUrl,
+        delegate: 'GPU',
+      },
+      runningMode: 'IMAGE',
+    });
+    return true;
+  },
+
+  async detect(frameUrl) {
+    if (!poseLandmarker) {
+      throw new Error('Pose landmarker is not initialized');
+    }
+    const image = await loadImage(frameUrl);
+    const result = poseLandmarker.detect(image);
+    return result.landmarks?.[0] || [];
+  },
+};
+</script>
+</body>
+</html>`;
+  }
+
+  private sendFile(res: http.ServerResponse, filePath: string, contentType: string): void {
+    if (!fs.existsSync(filePath)) {
+      this.notFound(res);
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+
+  private sendText(res: http.ServerResponse, contentType: string, text: string): void {
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    });
+    res.end(text);
+  }
+
+  private notFound(res: http.ServerResponse): void {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+  }
+
+  private getChromePath(): string {
+    const candidates = [
+      process.env.CHROME_PATH,
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    ].filter(Boolean) as string[];
+
+    const chromePath = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!chromePath) {
+      throw new Error('Chrome or Edge was not found. Set CHROME_PATH to a Chromium-based browser executable.');
+    }
+
+    return chromePath;
+  }
+
+  private shouldLogChromeStderr(text: string): boolean {
+    const ignoredPatterns = [
+      'google_apis\\gcm',
+      'PHONE_REGISTRATION_ERROR',
+      'DEPRECATED_ENDPOINT',
+      'Authentication Failed: wrong_secret',
+      'Failed to log in to GCM',
+    ];
+
+    return text.toLowerCase().includes('error') &&
+      !ignoredPatterns.some((pattern) => text.includes(pattern));
+  }
+
+  private getFreePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        const port = typeof address === 'object' && address ? address.port : 0;
+        server.close(() => resolve(port));
+      });
+    });
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
 export class MediaPipePoseEstimationService {
-  private static poseLandmarker: PoseLandmarker | null = null;
+  private static runtime: BrowserPoseRuntime | null = null;
   private static initPromise: Promise<void> | null = null;
 
   /**
    * Initialize the MediaPipe pose model (singleton pattern)
    */
   static async initialize(): Promise<void> {
-    // Return existing promise if already initializing
     if (this.initPromise) {
       return this.initPromise;
     }
 
-    this.initPromise = this._initializeModel();
+    this.initPromise = this.initializeRuntime();
     return this.initPromise;
-  }
-
-  /**
-   * Internal model initialization
-   */
-  private static async _initializeModel(): Promise<void> {
-    try {
-      if (this.poseLandmarker) {
-        return; // Already initialized
-      }
-
-      const vision = await FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
-      );
-
-      this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-        },
-        runningMode: 'IMAGE',
-      });
-
-      console.log('MediaPipe Pose Landmarker initialized successfully');
-    } catch (error) {
-      this.initPromise = null; // Reset to allow retry
-      throw new Error(`Failed to initialize MediaPipe: ${error}`);
-    }
   }
 
   /**
@@ -100,44 +566,32 @@ export class MediaPipePoseEstimationService {
     frameIndex: number,
     timestampMs: number
   ): Promise<FrameData> {
-    if (!this.poseLandmarker) {
+    if (!this.runtime) {
       throw new Error('MediaPipe not initialized. Call initialize() first.');
     }
 
     try {
-      // Read image file
-      const imageData = fs.readFileSync(imagePath);
-      const blob = new Blob([imageData], { type: 'image/png' });
-      const bitmap = await createImageBitmap(blob);
-
-      // Run pose detection
-      const result = this.poseLandmarker.detect(bitmap as any);
-
-      // Process landmarks
+      const landmarkList = await this.runtime.detect(imagePath);
       const landmarks: Partial<Record<LandmarkName, Landmark>> = {};
       const visibilities: number[] = [];
 
-      if (result.landmarks && result.landmarks.length > 0) {
-        const landmarkList = result.landmarks[0] as Array<{ x: number; y: number; z?: number; visibility?: number }>;
+      landmarkList.forEach((landmark, index) => {
+        const name = LANDMARK_NAMES[index];
 
-        landmarkList.forEach((landmark, index) => {
-          const name = LANDMARK_NAMES[index];
+        if (!name) {
+          return;
+        }
 
-          if (!name) {
-            return;
-          }
+        landmarks[name] = {
+          x: landmark.x,
+          y: landmark.y,
+          z: landmark.z || 0,
+          visibility: landmark.visibility || 0,
+        };
+        visibilities.push(landmark.visibility || 0);
+      });
 
-          landmarks[name] = {
-            x: landmark.x,
-            y: landmark.y,
-            z: landmark.z || 0,
-            visibility: landmark.visibility || 0,
-          };
-          visibilities.push(landmark.visibility || 0);
-        });
-      }
-
-      const landmarkConfidence = calculateAverageVisibility(visibilities);
+      calculateAverageVisibility(visibilities);
 
       return {
         frameIndex,
@@ -160,10 +614,8 @@ export class MediaPipePoseEstimationService {
    * Cleanup resources
    */
   static async cleanup(): Promise<void> {
-    if (this.poseLandmarker) {
-      this.poseLandmarker.close();
-      this.poseLandmarker = null;
-    }
+    await this.runtime?.stop();
+    this.runtime = null;
     this.initPromise = null;
   }
 
@@ -171,6 +623,26 @@ export class MediaPipePoseEstimationService {
    * Check if initialized
    */
   static isInitialized(): boolean {
-    return this.poseLandmarker !== null;
+    return this.runtime !== null;
+  }
+
+  private static async initializeRuntime(): Promise<void> {
+    try {
+      if (this.runtime) {
+        return;
+      }
+
+      const runtime = new BrowserPoseRuntime();
+      await runtime.start();
+      this.runtime = runtime;
+
+      console.log('MediaPipe Pose Landmarker initialized successfully in headless Chrome');
+    } catch (error) {
+      this.initPromise = null;
+      await this.runtime?.stop();
+      this.runtime = null;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to initialize MediaPipe browser runtime: ${message}`);
+    }
   }
 }
