@@ -12,3 +12,5 @@ frames/
 *.mp4
 *.mov
 *.avi
+.env
+.env.example
