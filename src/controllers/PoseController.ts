@@ -67,6 +67,14 @@ export class PoseController {
       // Get video metadata
       let videoInfo = await FrameExtractionService.getVideoInfo(uploadedVideoPath);
 
+      // Warm MediaPipe while ffmpeg extracts frames.
+      if (!MediaPipePoseEstimationService.isInitialized()) {
+        console.log('Initializing MediaPipe...');
+      }
+      const mediaPipeReady = MediaPipePoseEstimationService.isInitialized()
+        ? Promise.resolve()
+        : MediaPipePoseEstimationService.initialize();
+
       // Extract frames
       console.log(`Extracting frames at ${config.frameSampleIntervalMs}ms intervals`);
       const extractedFrames = await FrameExtractionService.extractFrames(uploadedVideoPath, {
@@ -76,51 +84,43 @@ export class PoseController {
 
       console.log(`Extracted ${extractedFrames.length} frames`);
 
-      // Initialize MediaPipe if not already done
-      if (!MediaPipePoseEstimationService.isInitialized()) {
-        console.log('Initializing MediaPipe...');
-        await MediaPipePoseEstimationService.initialize();
-      }
+      // Wait for MediaPipe if frame extraction finished first.
+      await mediaPipeReady;
 
       // Process each frame
       const frameDataList: FrameData[] = [];
       const lowConfidenceFrames: number[] = [];
       const warnings: string[] = [];
 
-      for (const frame of extractedFrames) {
-        try {
-          // Estimate pose
-          const frameData = await MediaPipePoseEstimationService.estimatePose(
-            frame.framePath,
-            frame.frameIndex,
-            frame.timestampMs
-          );
+      console.log(`Estimating poses for ${extractedFrames.length} frames`);
+      const poseEstimationStartedAt = Date.now();
+      const estimatedFrames = await MediaPipePoseEstimationService.estimatePoses(
+        extractedFrames.map((frame) => ({
+          framePath: frame.framePath,
+          frameIndex: frame.frameIndex,
+          timestampMs: frame.timestampMs,
+        }))
+      );
+      console.log(`Pose estimation completed in ${Date.now() - poseEstimationStartedAt}ms`);
 
-          // Calculate angles
-          const angleOptions: AngleCalculationOptions = {
-            minVisibility: config.minLandmarkVisibility,
-          };
-          AngleCalculationService.calculateAngles(frameData, angleOptions);
+      for (const frameData of estimatedFrames) {
+        // Calculate angles
+        const angleOptions: AngleCalculationOptions = {
+          minVisibility: config.minLandmarkVisibility,
+        };
+        AngleCalculationService.calculateAngles(frameData, angleOptions);
 
-          // Track low confidence frames
-          const landmarkConfidence =
-            Object.values(frameData.landmarks).reduce((sum, l) => sum + (l?.visibility || 0), 0) /
-              Object.keys(frameData.landmarks).length || 0;
+        // Track low confidence frames
+        const landmarkCount = Object.keys(frameData.landmarks).length;
+        const landmarkConfidence = landmarkCount > 0
+          ? Object.values(frameData.landmarks).reduce((sum, l) => sum + (l?.visibility || 0), 0) / landmarkCount
+          : 0;
 
-          if (landmarkConfidence < config.minLandmarkVisibility) {
-            lowConfidenceFrames.push(frame.frameIndex);
-          }
-
-          frameDataList.push(frameData);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          if (errorMessage.includes('MediaPipe runtime failed')) {
-            throw error;
-          }
-
-          console.error(`Error processing frame ${frame.frameIndex}:`, error);
-          warnings.push(`Failed to process frame ${frame.frameIndex}`);
+        if (landmarkConfidence < config.minLandmarkVisibility) {
+          lowConfidenceFrames.push(frameData.frameIndex);
         }
+
+        frameDataList.push(frameData);
       }
 
       // Calculate quality metrics
@@ -193,7 +193,9 @@ export class PoseController {
 
       if (includeEvaluation) {
         const movementSummary = MovementSummaryService.summarize(response, exerciseType!);
+        const evaluationStartedAt = Date.now();
         const evaluation = await LlmExerciseEvaluationService.evaluate(exerciseType!, movementSummary);
+        console.log(`Groq evaluation completed in ${Date.now() - evaluationStartedAt}ms`);
         res.status(200).json({
           poseAnalysis: response,
           movementSummary,

@@ -60,6 +60,12 @@ type BrowserLandmark = {
   visibility?: number;
 };
 
+export type PoseFrameInput = {
+  framePath: string;
+  frameIndex: number;
+  timestampMs: number;
+};
+
 type CdpResponse = {
   id?: number;
   result?: any;
@@ -181,12 +187,13 @@ class BrowserPoseRuntime {
     'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
 
   private chrome: ChildProcessWithoutNullStreams | null = null;
-  private cdp: CdpClient | null = null;
+  private clients: CdpClient[] = [];
   private server: http.Server | null = null;
   private serverPort = 0;
   private chromeDebugPort = 0;
   private chromeUserDataDir = '';
   private readonly frameFiles = new Map<string, string>();
+  private readonly workerCount = this.getWorkerCount();
 
   async start(): Promise<void> {
     this.serverPort = await this.getFreePort();
@@ -195,28 +202,47 @@ class BrowserPoseRuntime {
 
     await this.startServer();
     await this.startChrome();
-    await this.openRunnerPage();
+    await this.openRunnerPages();
   }
 
-  async detect(imagePath: string): Promise<BrowserLandmark[]> {
-    if (!this.cdp) {
+  async detectBatch(imagePaths: string[]): Promise<BrowserLandmark[][]> {
+    if (this.clients.length === 0) {
       throw new Error('Browser pose runtime is not initialized');
     }
 
-    const frameId = randomUUID();
-    this.frameFiles.set(frameId, path.resolve(imagePath));
+    if (imagePaths.length === 0) {
+      return [];
+    }
+
+    const frames = imagePaths.map((imagePath) => {
+      const frameId = randomUUID();
+      this.frameFiles.set(frameId, path.resolve(imagePath));
+      return {
+        frameId,
+        frameUrl: `http://127.0.0.1:${this.serverPort}/frame/${frameId}`,
+      };
+    });
 
     try {
-      const frameUrl = `http://127.0.0.1:${this.serverPort}/frame/${frameId}`;
-      return await this.cdp.evaluate(`window.poseRuntime.detect(${JSON.stringify(frameUrl)})`);
+      const chunks = this.splitIntoChunks(frames, this.clients.length);
+      const results = await Promise.all(chunks.map((chunk, index) => {
+        if (chunk.length === 0) {
+          return Promise.resolve([] as BrowserLandmark[][]);
+        }
+
+        const urls = chunk.map((frame) => frame.frameUrl);
+        return this.clients[index].evaluate(`window.poseRuntime.detectBatch(${JSON.stringify(urls)})`) as Promise<BrowserLandmark[][]>;
+      }));
+
+      return results.flat();
     } finally {
-      this.frameFiles.delete(frameId);
+      frames.forEach((frame) => this.frameFiles.delete(frame.frameId));
     }
   }
 
   async stop(): Promise<void> {
-    this.cdp?.close();
-    this.cdp = null;
+    this.clients.forEach((client) => client.close());
+    this.clients = [];
 
     if (this.chrome) {
       this.chrome.kill();
@@ -281,38 +307,43 @@ class BrowserPoseRuntime {
     await this.waitForChrome();
   }
 
-  private async openRunnerPage(): Promise<void> {
-    const target = await this.createChromeTarget(`http://127.0.0.1:${this.serverPort}/runner`);
-    this.cdp = new CdpClient();
-    await this.cdp.connect(target.webSocketDebuggerUrl);
-    await this.cdp.send('Runtime.enable');
-    await this.cdp.send('Page.enable');
-
-    const loadEvent = this.cdp.waitForEvent('Page.loadEventFired');
-    await this.cdp.send('Page.navigate', { url: `http://127.0.0.1:${this.serverPort}/runner` });
-    await loadEvent;
-
-    await this.waitForPoseRuntime();
+  private async openRunnerPages(): Promise<void> {
+    const clients = await Promise.all(
+      Array.from({ length: this.workerCount }, () => this.openRunnerPage())
+    );
 
     const modelPath = process.env.MEDIAPIPE_POSE_MODEL_PATH?.trim();
     const modelUrl = modelPath
       ? `http://127.0.0.1:${this.serverPort}/model`
       : BrowserPoseRuntime.defaultModelUrl;
 
-    await this.cdp.evaluate(`window.poseRuntime.initialize({
+    await Promise.all(clients.map((client) => client.evaluate(`window.poseRuntime.initialize({
       wasmBaseUrl: ${JSON.stringify(`http://127.0.0.1:${this.serverPort}/wasm`)},
       modelUrl: ${JSON.stringify(modelUrl)}
-    })`);
+    })`)));
+
+    this.clients = clients;
   }
 
-  private async waitForPoseRuntime(): Promise<void> {
-    if (!this.cdp) {
-      throw new Error('Chrome DevTools is not connected');
-    }
+  private async openRunnerPage(): Promise<CdpClient> {
+    const target = await this.createChromeTarget(`http://127.0.0.1:${this.serverPort}/runner`);
+    const cdp = new CdpClient();
+    await cdp.connect(target.webSocketDebuggerUrl);
+    await cdp.send('Runtime.enable');
+    await cdp.send('Page.enable');
 
+    const loadEvent = cdp.waitForEvent('Page.loadEventFired');
+    await cdp.send('Page.navigate', { url: `http://127.0.0.1:${this.serverPort}/runner` });
+    await loadEvent;
+
+    await this.waitForPoseRuntime(cdp);
+    return cdp;
+  }
+
+  private async waitForPoseRuntime(cdp: CdpClient): Promise<void> {
     const started = Date.now();
     while (Date.now() - started < 15000) {
-      const ready = await this.cdp.evaluate('Boolean(window.poseRuntime)');
+      const ready = await cdp.evaluate('Boolean(window.poseRuntime)');
       if (ready) {
         return;
       }
@@ -461,6 +492,14 @@ window.poseRuntime = {
     const result = poseLandmarker.detect(image);
     return result.landmarks?.[0] || [];
   },
+
+  async detectBatch(frameUrls) {
+    const results = [];
+    for (const frameUrl of frameUrls) {
+      results.push(await this.detect(frameUrl));
+    }
+    return results;
+  },
 };
 </script>
 </body>
@@ -525,6 +564,29 @@ window.poseRuntime = {
       !ignoredPatterns.some((pattern) => text.includes(pattern));
   }
 
+  private getWorkerCount(): number {
+    const rawValue = Number(process.env.MEDIAPIPE_BROWSER_WORKERS || 2);
+    if (!Number.isFinite(rawValue) || rawValue < 1) {
+      return 2;
+    }
+
+    return Math.min(Math.floor(rawValue), 4);
+  }
+
+  private splitIntoChunks<T>(items: T[], chunkCount: number): T[][] {
+    const size = Math.ceil(items.length / chunkCount);
+    const chunks: T[][] = [];
+    for (let index = 0; index < items.length; index += size) {
+      chunks.push(items.slice(index, index + size));
+    }
+
+    while (chunks.length < chunkCount) {
+      chunks.push([]);
+    }
+
+    return chunks;
+  }
+
   private getFreePort(): Promise<number> {
     return new Promise((resolve, reject) => {
       const server = net.createServer();
@@ -571,34 +633,12 @@ export class MediaPipePoseEstimationService {
     }
 
     try {
-      const landmarkList = await this.runtime.detect(imagePath);
-      const landmarks: Partial<Record<LandmarkName, Landmark>> = {};
-      const visibilities: number[] = [];
-
-      landmarkList.forEach((landmark, index) => {
-        const name = LANDMARK_NAMES[index];
-
-        if (!name) {
-          return;
-        }
-
-        landmarks[name] = {
-          x: landmark.x,
-          y: landmark.y,
-          z: landmark.z || 0,
-          visibility: landmark.visibility || 0,
-        };
-        visibilities.push(landmark.visibility || 0);
-      });
-
-      calculateAverageVisibility(visibilities);
-
-      return {
+      const [landmarkList] = await this.runtime.detectBatch([imagePath]);
+      return this.toFrameData({
+        framePath: imagePath,
         frameIndex,
         timestampMs,
-        landmarks,
-        angles: {}, // Will be populated by AngleCalculationService
-      };
+      }, landmarkList || []);
     } catch (error) {
       console.error(`Failed to estimate pose for frame ${frameIndex}:`, error);
       return {
@@ -607,6 +647,29 @@ export class MediaPipePoseEstimationService {
         landmarks: {},
         angles: {},
       };
+    }
+  }
+
+  static async estimatePoses(frames: PoseFrameInput[]): Promise<FrameData[]> {
+    if (!this.runtime) {
+      throw new Error('MediaPipe not initialized. Call initialize() first.');
+    }
+
+    if (frames.length === 0) {
+      return [];
+    }
+
+    try {
+      const landmarkLists = await this.runtime.detectBatch(frames.map((frame) => frame.framePath));
+      return frames.map((frame, index) => this.toFrameData(frame, landmarkLists[index] || []));
+    } catch (error) {
+      console.error('Failed to estimate poses for frame batch:', error);
+      return frames.map((frame) => ({
+        frameIndex: frame.frameIndex,
+        timestampMs: frame.timestampMs,
+        landmarks: {},
+        angles: {},
+      }));
     }
   }
 
@@ -644,5 +707,35 @@ export class MediaPipePoseEstimationService {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to initialize MediaPipe browser runtime: ${message}`);
     }
+  }
+
+  private static toFrameData(frame: PoseFrameInput, landmarkList: BrowserLandmark[]): FrameData {
+    const landmarks: Partial<Record<LandmarkName, Landmark>> = {};
+    const visibilities: number[] = [];
+
+    landmarkList.forEach((landmark, index) => {
+      const name = LANDMARK_NAMES[index];
+
+      if (!name) {
+        return;
+      }
+
+      landmarks[name] = {
+        x: landmark.x,
+        y: landmark.y,
+        z: landmark.z || 0,
+        visibility: landmark.visibility || 0,
+      };
+      visibilities.push(landmark.visibility || 0);
+    });
+
+    calculateAverageVisibility(visibilities);
+
+    return {
+      frameIndex: frame.frameIndex,
+      timestampMs: frame.timestampMs,
+      landmarks,
+      angles: {},
+    };
   }
 }
