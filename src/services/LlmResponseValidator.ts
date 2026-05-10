@@ -44,6 +44,14 @@ export class LlmResponseValidator {
       throw new Error('Invalid LLM response: score must be a number between 0 and 100');
     }
 
+    if (!('isGoodTechnique' in parsed)) {
+      parsed.isGoodTechnique = parsed.score >= 70;
+    }
+
+    if (typeof parsed.isGoodTechnique !== 'boolean') {
+      throw new Error('Invalid LLM response: isGoodTechnique must be a boolean');
+    }
+
     if (typeof parsed.scoreExplanation !== 'string') {
       throw new Error('Invalid LLM response: scoreExplanation must be a string');
     }
@@ -83,6 +91,29 @@ export class LlmResponseValidator {
     });
 
     parsed.issues = parsed.issues.map((item: any) => this.validateIssue(item));
+
+    if (!('cameraView' in parsed)) {
+      parsed.cameraView = 'UNKNOWN';
+    }
+
+    if (!['SIDE_VIEW', 'FRONT_VIEW', 'UNKNOWN'].includes(parsed.cameraView)) {
+      throw new Error("Invalid LLM response: cameraView must be 'SIDE_VIEW', 'FRONT_VIEW', or 'UNKNOWN'");
+    }
+
+    if (!('ignoredMetrics' in parsed)) {
+      parsed.ignoredMetrics = [];
+    }
+
+    if (!Array.isArray(parsed.ignoredMetrics)) {
+      throw new Error('Invalid LLM response: ignoredMetrics must be an array');
+    }
+
+    parsed.ignoredMetrics = parsed.ignoredMetrics.map((item: any) => {
+      if (typeof item !== 'string') {
+        throw new Error('Invalid LLM response: ignoredMetrics must contain strings only');
+      }
+      return item;
+    });
 
     return parsed as ExerciseEvaluationResult;
   }

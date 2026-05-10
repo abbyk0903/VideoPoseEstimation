@@ -11,6 +11,73 @@ const exerciseType = process.env.EXERCISE_TYPE || 'squat'
 
 const movementSummary = {
   exerciseType,
+  cameraContext: {
+    cameraView: 'FRONT_VIEW',
+    cameraViewConfidence: 0.96,
+    reliableSide: 'BOTH',
+    symmetryAvailable: true,
+    ignoredReasons: [],
+    ignoredMetrics: [],
+    sideConfidence: {
+      leftAverageVisibility: 0.93,
+      rightAverageVisibility: 0.92,
+      leftReliableFramePercentage: 96.7,
+      rightReliableFramePercentage: 96.7
+    },
+    poseMetrics: {
+      squatDepth: 'minimum visible knee angle 63.1 degrees',
+      backAngle: 'average torso lean 12.3 degrees, max 22.9 degrees',
+      kneeTravel: 'average visible knee-to-ankle horizontal offset 0.04 normalized image units',
+      heelLift: 'average heel-to-ankle vertical offset 0.02 normalized image units',
+      visibleSideKneeHipAnkleAlignment: 'average knee distance from hip-ankle line 0.01 normalized image units'
+    }
+  },
+  scoringContext: {
+    exerciseType,
+    cameraView: 'FRONT_VIEW',
+    cameraViewConfidence: 0.96,
+    ignoredMetrics: [],
+    metrics: {
+      rangeOfMotion: {
+        metric: 'rangeOfMotion',
+        value: 'deepest primary joint angle 63.1 degrees, largest range 108.3 degrees',
+        interpretation: 'good',
+        confidence: 0.9,
+        sourceLandmarks: ['leftHip', 'leftKnee', 'leftAnkle', 'rightHip', 'rightKnee', 'rightAnkle'],
+        usableForScoring: true
+      },
+      bodyLean: {
+        metric: 'bodyLean',
+        value: 'average torso lean 12.3 degrees',
+        interpretation: 'normal_for_exercise',
+        confidence: 0.9,
+        sourceLandmarks: ['leftShoulder', 'rightShoulder', 'leftHip', 'rightHip'],
+        usableForScoring: true
+      },
+      movementControl: {
+        metric: 'movementControl',
+        value: 'rep confidence 0.82, movement stability score 0.79',
+        interpretation: 'smooth',
+        confidence: 0.8,
+        sourceLandmarks: [],
+        usableForScoring: true
+      },
+      leftRightSymmetry: {
+        metric: 'leftRightSymmetry',
+        value: 0.88,
+        interpretation: 'good',
+        confidence: 0.96,
+        sourceLandmarks: ['leftShoulder', 'rightShoulder', 'leftHip', 'rightHip', 'leftKnee', 'rightKnee', 'leftAnkle', 'rightAnkle'],
+        usableForScoring: true
+      }
+    },
+    scoringGuidance: [
+      'Numeric deviations are signals, not automatic technique failures.',
+      'Low scores below 50 require multiple reliable severe faults or clear unsafe movement.',
+      'Unavailable or low-confidence metrics reduce certainty instead of directly reducing technique score.',
+      'Only score a metric when it is reliable, relevant to the exercise, and visible from the camera angle.'
+    ]
+  },
   repMetrics: {
     estimatedRepCount: 5,
     repConfidence: 0.82,

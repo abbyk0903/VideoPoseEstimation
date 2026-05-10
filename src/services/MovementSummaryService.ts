@@ -31,6 +31,9 @@ import {
   calculateAverageVariability,
   calculateMissingPercentage,
 } from '../utils/stats';
+import { config } from '../config/env';
+import { CameraViewAnalysisService } from './CameraViewAnalysisService';
+import { ExerciseScoringContextService } from './ExerciseScoringContextService';
 
 const ANGLES_TO_TRACK: AngleName[] = [
   'leftKnee',
@@ -59,8 +62,18 @@ export class MovementSummaryService {
     // Summarize each angle
     const angleSummary = this.summarizeAngles(angleTimelines, angleConfidenceTimelines);
 
+    // Detect camera angle and reliable body side before interpretation.
+    const cameraContext = CameraViewAnalysisService.analyze(
+      poseAnalysis.frames,
+      angleSummary,
+      config.minLandmarkVisibility,
+      exerciseType
+    );
+
     // Calculate symmetry metrics
-    const symmetry = this.calculateSymmetry(angleTimelines);
+    const symmetry = cameraContext.symmetryAvailable
+      ? this.calculateSymmetry(angleTimelines)
+      : this.unavailableSymmetry();
 
     // Calculate movement consistency
     const movementConsistency = this.calculateMovementConsistency(angleSummary);
@@ -74,8 +87,19 @@ export class MovementSummaryService {
     // Estimate repetitions
     const repMetrics = this.estimateRepetitions(angleTimelines);
 
+    const scoringContext = ExerciseScoringContextService.build({
+      exerciseType,
+      cameraContext,
+      angleSummary,
+      symmetry,
+      movementConsistency,
+      repMetrics,
+    });
+
     return {
       exerciseType,
+      cameraContext,
+      scoringContext,
       repMetrics,
       angleSummary,
       symmetry,
@@ -202,6 +226,16 @@ export class MovementSummaryService {
       elbowDifferenceAvg,
       shoulderDifferenceAvg,
       overallSymmetryScore,
+    };
+  }
+
+  private static unavailableSymmetry(): SymmetryMetrics {
+    return {
+      kneeDifferenceAvg: null,
+      hipDifferenceAvg: null,
+      elbowDifferenceAvg: null,
+      shoulderDifferenceAvg: null,
+      overallSymmetryScore: null,
     };
   }
 

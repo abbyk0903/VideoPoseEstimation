@@ -122,6 +122,68 @@ export interface SymmetryMetrics {
   overallSymmetryScore: number | null;
 }
 
+export type CameraView = 'SIDE_VIEW' | 'FRONT_VIEW' | 'UNKNOWN';
+export type ReliableSide = 'LEFT' | 'RIGHT' | 'BOTH' | 'UNKNOWN';
+
+export interface CameraAwarePoseContext {
+  cameraView: CameraView;
+  cameraViewConfidence: number;
+  reliableSide: ReliableSide;
+  symmetryAvailable: boolean;
+  ignoredReasons: string[];
+  ignoredMetrics: string[];
+  sideConfidence: {
+    leftAverageVisibility: number | null;
+    rightAverageVisibility: number | null;
+    leftReliableFramePercentage: number;
+    rightReliableFramePercentage: number;
+  };
+  poseMetrics: {
+    squatDepth: string;
+    backAngle: string;
+    kneeTravel: string;
+    heelLift: string;
+    visibleSideKneeHipAnkleAlignment: string;
+  };
+}
+
+export type MetricInterpretation =
+  | 'good'
+  | 'acceptable'
+  | 'limited'
+  | 'excessive_but_controlled'
+  | 'problematic'
+  | 'normal_for_exercise'
+  | 'slightly_high'
+  | 'smooth'
+  | 'slightly_unstable'
+  | 'unstable'
+  | 'not_available';
+
+export interface ScoringMetric {
+  metric: string;
+  value: string | number | null;
+  interpretation: MetricInterpretation;
+  confidence: number;
+  sourceLandmarks: LandmarkName[];
+  usableForScoring: boolean;
+  ignoredReason?: string;
+}
+
+export interface ExerciseScoringContext {
+  exerciseType: string | null;
+  cameraView: CameraView;
+  cameraViewConfidence: number;
+  ignoredMetrics: string[];
+  metrics: {
+    rangeOfMotion: ScoringMetric;
+    bodyLean: ScoringMetric;
+    movementControl: ScoringMetric;
+    leftRightSymmetry: ScoringMetric;
+  };
+  scoringGuidance: string[];
+}
+
 /**
  * Movement consistency and stability metrics
  */
@@ -156,6 +218,8 @@ export interface RepetitionMetrics {
  */
 export interface MovementSummaryResult {
   exerciseType: string | null;
+  cameraContext: CameraAwarePoseContext;
+  scoringContext: ExerciseScoringContext;
   repMetrics: RepetitionMetrics;
   angleSummary: Partial<Record<AngleName, AngleSummaryStats>>;
   symmetry: SymmetryMetrics;
@@ -173,10 +237,13 @@ export interface EvaluationIssue {
 export interface ExerciseEvaluationResult {
   exerciseType: string;
   score: number;
+  isGoodTechnique: boolean;
   scoreExplanation: string;
   overallSummary: string;
   positiveFeedback: string[];
   issues: EvaluationIssue[];
   recommendations: string[];
   dataReliabilityNote: string;
+  cameraView: CameraView;
+  ignoredMetrics: string[];
 }
