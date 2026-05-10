@@ -7,9 +7,10 @@ import { ExerciseEvaluationResult, EvaluationIssue } from '../models/PoseTypes';
 export class LlmResponseValidator {
   static validateAndParse(rawText: string): ExerciseEvaluationResult {
     let parsed: any;
+    const jsonText = this.extractJsonObject(rawText);
 
     try {
-      parsed = JSON.parse(rawText);
+      parsed = JSON.parse(jsonText);
     } catch (error) {
       throw new Error('Invalid LLM response: response is not valid JSON');
     }
@@ -84,6 +85,26 @@ export class LlmResponseValidator {
     parsed.issues = parsed.issues.map((item: any) => this.validateIssue(item));
 
     return parsed as ExerciseEvaluationResult;
+  }
+
+  private static extractJsonObject(rawText: string): string {
+    const trimmed = rawText.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      return trimmed;
+    }
+
+    const fencedJson = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fencedJson?.[1]) {
+      return this.extractJsonObject(fencedJson[1]);
+    }
+
+    const start = trimmed.indexOf('{');
+    const end = trimmed.lastIndexOf('}');
+    if (start !== -1 && end !== -1 && end > start) {
+      return trimmed.slice(start, end + 1);
+    }
+
+    return trimmed;
   }
 
   private static validateIssue(item: any): EvaluationIssue {

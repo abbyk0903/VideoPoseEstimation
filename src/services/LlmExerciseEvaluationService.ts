@@ -7,6 +7,17 @@ import { MovementSummaryResult, ExerciseEvaluationResult } from '../models/PoseT
 import { ExerciseEvaluationPromptBuilder } from './ExerciseEvaluationPromptBuilder';
 import { LlmResponseValidator } from './LlmResponseValidator';
 
+type GroqChatPayload = {
+  model: string;
+  messages: Array<{
+    role: 'system' | 'user';
+    content: string;
+  }>;
+  temperature: number;
+  max_tokens: number;
+  response_format?: { type: 'json_object' };
+};
+
 export class LlmExerciseEvaluationService {
   static async evaluate(
     exerciseType: string,
@@ -20,7 +31,7 @@ export class LlmExerciseEvaluationService {
     const url = 'https://api.groq.com/openai/v1/chat/completions';
     const prompt = ExerciseEvaluationPromptBuilder.buildPrompt(exerciseType, movementSummary);
 
-    const payload = {
+    const payload: GroqChatPayload = {
       model,
       messages: [
         {
@@ -33,10 +44,46 @@ export class LlmExerciseEvaluationService {
         },
       ],
       temperature: 0.2,
-      max_tokens: 1200,
+      max_tokens: 2000,
+      response_format: { type: 'json_object' },
     };
 
-    const response = await fetch(url, {
+    const result = await this.createChatCompletion(url, payload);
+    const rawContent = this.extractTextFromGroqResponse(result);
+
+    return LlmResponseValidator.validateAndParse(rawContent);
+  }
+
+  private static async createChatCompletion(url: string, payload: GroqChatPayload): Promise<any> {
+    const response = await this.postChatCompletion(url, payload);
+    if (response.ok) {
+      return response.json();
+    }
+
+    const text = await response.text();
+    const canRetryWithoutJsonMode =
+      payload.response_format &&
+      response.status >= 400 &&
+      response.status < 500 &&
+      text.toLowerCase().includes('response_format');
+
+    if (canRetryWithoutJsonMode) {
+      const fallbackPayload = { ...payload };
+      delete fallbackPayload.response_format;
+      const fallbackResponse = await this.postChatCompletion(url, fallbackPayload);
+      if (fallbackResponse.ok) {
+        return fallbackResponse.json();
+      }
+
+      const fallbackText = await fallbackResponse.text();
+      throw new Error(`Groq API request failed with status ${fallbackResponse.status}: ${fallbackText}`);
+    }
+
+    throw new Error(`Groq API request failed with status ${response.status}: ${text}`);
+  }
+
+  private static postChatCompletion(url: string, payload: GroqChatPayload): Promise<Response> {
+    return fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -44,16 +91,6 @@ export class LlmExerciseEvaluationService {
       },
       body: JSON.stringify(payload),
     });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Groq API request failed with status ${response.status}: ${text}`);
-    }
-
-    const result = await response.json();
-    const rawContent = this.extractTextFromGroqResponse(result);
-
-    return LlmResponseValidator.validateAndParse(rawContent);
   }
 
   private static extractTextFromGroqResponse(response: any): string {

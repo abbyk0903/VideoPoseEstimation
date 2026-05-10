@@ -19,22 +19,23 @@ The user performed this exercise: ${exerciseType}.
 Here is the movement summary:
 ${movementSummaryJson}
 
-Evaluate the user’s form according to common biomechanics for the given exercise.
+Evaluate the user's form according to common biomechanics for the given exercise.
 Use the numeric metrics to support your evaluation.
 Do not invent measurements that are not present.
 If confidence or data reliability is low, mention that clearly.
-Return only valid JSON in the exact schema below and do not include any additional text:
+Return only valid JSON in the exact schema below and do not include any additional text.
+The issue severity value must be exactly one of: "low", "medium", "high".
 
 {
   "exerciseType": "<exerciseType>",
   "score": 0,
   "scoreExplanation": "<brief explanation for the score>",
   "overallSummary": "<overall summary of the form>",
-  "positiveFeedback": ["<positive observation>", "<positive observation>"] ,
+  "positiveFeedback": ["<positive observation>", "<positive observation>"],
   "issues": [
     {
       "title": "<issue title>",
-      "severity": "low | medium | high",
+      "severity": "medium",
       "explanation": "<explanation of the issue>",
       "suggestion": "<suggestion to improve>"
     }
