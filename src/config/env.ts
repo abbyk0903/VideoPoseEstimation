@@ -10,6 +10,10 @@ dotenv.config();
 interface Config {
   port: number;
   frameSampleIntervalMs: number;
+  maxAnalysisFrames: number;
+  extractedFrameMaxWidth: number;
+  extractedFrameFormat: 'jpg' | 'png';
+  extractedFrameJpegQuality: number;
   maxVideoSizeMB: number;
   minLandmarkVisibility: number;
   tempDir: string;
@@ -46,6 +50,10 @@ function getEnvNumber(name: string, defaultValue: number): number {
 export const config: Config = {
   port: getEnvNumber('PORT', 4000),
   frameSampleIntervalMs: getEnvNumber('FRAME_SAMPLE_INTERVAL_MS', 200),
+  maxAnalysisFrames: getEnvNumber('MAX_ANALYSIS_FRAMES', 180),
+  extractedFrameMaxWidth: getEnvNumber('EXTRACTED_FRAME_MAX_WIDTH', 640),
+  extractedFrameFormat: (process.env.EXTRACTED_FRAME_FORMAT === 'png' ? 'png' : 'jpg'),
+  extractedFrameJpegQuality: getEnvNumber('EXTRACTED_FRAME_JPEG_QUALITY', 3),
   maxVideoSizeMB: getEnvNumber('MAX_VIDEO_SIZE_MB', 100),
   minLandmarkVisibility: getEnvNumber('MIN_LANDMARK_VISIBILITY', 0.5),
   tempDir: getEnvVariable('TEMP_DIR', './temp'),

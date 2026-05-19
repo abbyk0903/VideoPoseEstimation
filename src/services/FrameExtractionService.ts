@@ -28,6 +28,10 @@ export interface VideoInfo {
 export interface FrameExtractionOptions {
   sampleIntervalMs: number;
   outputDir: string;
+  frameFormat?: 'jpg' | 'png';
+  maxWidth?: number;
+  jpegQuality?: number;
+  videoInfo?: VideoInfo;
 }
 
 export interface ExtractedFrame {
@@ -35,6 +39,7 @@ export interface ExtractedFrame {
   frameNumber: number;
   timestampMs: number;
   framePath: string;
+  mimeType: string;
 }
 
 export class FrameExtractionService {
@@ -99,20 +104,31 @@ export class FrameExtractionService {
   ): Promise<ExtractedFrame[]> {
     await ensureDirectoryExists(options.outputDir);
 
-    const videoInfo = await this.getVideoInfo(videoPath);
-    const outputPattern = path.join(options.outputDir, 'frame_%06d.png');
+    const videoInfo = options.videoInfo || await this.getVideoInfo(videoPath);
+    const frameFormat = options.frameFormat || 'jpg';
+    const outputPattern = path.join(options.outputDir, `frame_%06d.${frameFormat}`);
     const frameRate = 1000 / options.sampleIntervalMs;
+    const filters = [`fps=${frameRate}`];
+    if (options.maxWidth && options.maxWidth > 0) {
+      filters.push(`scale='min(${options.maxWidth},iw)':-2`);
+    }
+
+    const outputOptions = [
+      '-vf',
+      filters.join(','),
+      '-start_number',
+      '0',
+    ];
+
+    if (frameFormat === 'jpg') {
+      outputOptions.push('-q:v', String(options.jpegQuality || 3));
+    }
 
     return new Promise((resolve, reject) => {
       const stderrLines: string[] = [];
 
       ffmpeg(videoPath)
-        .outputOptions([
-          '-vf',
-          `fps=${frameRate}`,
-          '-start_number',
-          '0',
-        ])
+        .outputOptions(outputOptions)
         .output(outputPattern)
         .on('stderr', (line) => {
           stderrLines.push(line);
@@ -120,7 +136,7 @@ export class FrameExtractionService {
         .on('end', () => {
           try {
             const files = fs.readdirSync(options.outputDir)
-              .filter((f) => f.startsWith('frame_') && f.endsWith('.png'))
+              .filter((f) => f.startsWith('frame_') && f.endsWith(`.${frameFormat}`))
               .sort((a, b) => {
                 const numA = parseInt(a.match(/\d+/)?.[0] || '0');
                 const numB = parseInt(b.match(/\d+/)?.[0] || '0');
@@ -135,6 +151,7 @@ export class FrameExtractionService {
                 frameNumber: index,
                 timestampMs,
                 framePath,
+                mimeType: frameFormat === 'jpg' ? 'image/jpeg' : 'image/png',
               };
             });
 

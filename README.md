@@ -97,6 +97,10 @@ PORT=4000                      # Server port
 FRAME_SAMPLE_INTERVAL_MS=200  # Frame sampling interval in milliseconds
 MAX_VIDEO_SIZE_MB=100         # Maximum video upload size
 MIN_LANDMARK_VISIBILITY=0.5   # Minimum confidence threshold for landmarks
+MAX_ANALYSIS_FRAMES=180       # Cap sampled frames by increasing interval for long videos
+EXTRACTED_FRAME_FORMAT=jpg    # jpg is faster/smaller than png; use png for lossless frames
+EXTRACTED_FRAME_MAX_WIDTH=640 # Downscale extracted frames before MediaPipe analysis
+EXTRACTED_FRAME_JPEG_QUALITY=3 # FFmpeg JPEG quality, lower is better quality
 ```
 
 ## Running the Service
@@ -529,6 +533,14 @@ This runs the full pipeline:
 
 If `includeEvaluation=true`, `exerciseType` is required.
 
+For faster evaluation responses, you can omit the large frame-by-frame landmark payload:
+
+```http
+POST /api/pose/analyze-video?includeEvaluation=true&includeFrames=false
+```
+
+You can also pass `includePoseAnalysis=false` with `includeEvaluation=true` to return only `movementSummary` and `evaluation`.
+
 ### Summarize Movement
 
 ```http
@@ -800,10 +812,16 @@ GROQ_MODEL=llama-3.1-8b-instant     # Groq model for evaluation
 
 # Video Processing
 FRAME_SAMPLE_INTERVAL_MS=200  # Milliseconds between sampled frames
+MAX_ANALYSIS_FRAMES=180       # Maximum sampled frames per video; longer videos use a larger interval
+EXTRACTED_FRAME_FORMAT=jpg    # jpg or png
+EXTRACTED_FRAME_MAX_WIDTH=640 # Downscale extracted frames to this width before analysis
+EXTRACTED_FRAME_JPEG_QUALITY=3 # FFmpeg JPEG quality, lower is better quality
 MAX_VIDEO_SIZE_MB=100         # Maximum video file size in MB
 
 # Pose Detection
 MIN_LANDMARK_VISIBILITY=0.5   # Minimum confidence threshold (0-1)
+MEDIAPIPE_BATCH_SIZE=48       # Number of frames sent to the browser runtime per batch
+MEDIAPIPE_BROWSER_WORKERS=2   # Browser runner pages used for parallel pose detection
 
 # File Paths
 TEMP_DIR=./temp               # Temporary directory

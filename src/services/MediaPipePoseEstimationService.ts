@@ -66,6 +66,11 @@ export type PoseFrameInput = {
   timestampMs: number;
 };
 
+type ServedFrame = {
+  path: string;
+  mimeType: string;
+};
+
 type CdpResponse = {
   id?: number;
   result?: any;
@@ -192,7 +197,7 @@ class BrowserPoseRuntime {
   private serverPort = 0;
   private chromeDebugPort = 0;
   private chromeUserDataDir = '';
-  private readonly frameFiles = new Map<string, string>();
+  private readonly frameFiles = new Map<string, ServedFrame>();
   private readonly workerCount = this.getWorkerCount();
 
   async start(): Promise<void> {
@@ -216,7 +221,10 @@ class BrowserPoseRuntime {
 
     const frames = imagePaths.map((imagePath) => {
       const frameId = randomUUID();
-      this.frameFiles.set(frameId, path.resolve(imagePath));
+      this.frameFiles.set(frameId, {
+        path: path.resolve(imagePath),
+        mimeType: this.getMimeType(imagePath),
+      });
       return {
         frameId,
         frameUrl: `http://127.0.0.1:${this.serverPort}/frame/${frameId}`,
@@ -427,12 +435,12 @@ class BrowserPoseRuntime {
 
       if (url.pathname.startsWith('/frame/')) {
         const frameId = path.basename(url.pathname);
-        const framePath = this.frameFiles.get(frameId);
-        if (!framePath) {
+        const frame = this.frameFiles.get(frameId);
+        if (!frame) {
           this.notFound(res);
           return;
         }
-        this.sendFile(res, framePath, 'image/png');
+        this.sendFile(res, frame.path, frame.mimeType);
         return;
       }
 
@@ -573,6 +581,14 @@ window.poseRuntime = {
     return Math.min(Math.floor(rawValue), 4);
   }
 
+  private getMimeType(filePath: string): string {
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension === '.jpg' || extension === '.jpeg') {
+      return 'image/jpeg';
+    }
+    return 'image/png';
+  }
+
   private splitIntoChunks<T>(items: T[], chunkCount: number): T[][] {
     const size = Math.ceil(items.length / chunkCount);
     const chunks: T[][] = [];
@@ -660,7 +676,15 @@ export class MediaPipePoseEstimationService {
     }
 
     try {
-      const landmarkLists = await this.runtime.detectBatch(frames.map((frame) => frame.framePath));
+      const landmarkLists: BrowserLandmark[][] = [];
+      const batchSize = this.getBatchSize();
+
+      for (let index = 0; index < frames.length; index += batchSize) {
+        const batch = frames.slice(index, index + batchSize);
+        const batchResults = await this.runtime.detectBatch(batch.map((frame) => frame.framePath));
+        landmarkLists.push(...batchResults);
+      }
+
       return frames.map((frame, index) => this.toFrameData(frame, landmarkLists[index] || []));
     } catch (error) {
       console.error('Failed to estimate poses for frame batch:', error);
@@ -737,5 +761,14 @@ export class MediaPipePoseEstimationService {
       landmarks,
       angles: {},
     };
+  }
+
+  private static getBatchSize(): number {
+    const rawValue = Number(process.env.MEDIAPIPE_BATCH_SIZE || 48);
+    if (!Number.isFinite(rawValue) || rawValue < 1) {
+      return 48;
+    }
+
+    return Math.min(Math.floor(rawValue), 200);
   }
 }

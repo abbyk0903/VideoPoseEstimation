@@ -35,6 +35,8 @@ export class PoseController {
     let videoId: string = '';
 
     try {
+      const requestStartedAt = Date.now();
+
       // Validate upload
       const videoFile = req.files?.video as UploadedFile | undefined;
       const validation = validateVideoUpload(videoFile, config.maxVideoSizeMB);
@@ -65,7 +67,9 @@ export class PoseController {
       console.log(`Video uploaded: ${uploadedVideoPath}`);
 
       // Get video metadata
+      const probeStartedAt = Date.now();
       let videoInfo = await FrameExtractionService.getVideoInfo(uploadedVideoPath);
+      console.log(`Video probe completed in ${Date.now() - probeStartedAt}ms`);
 
       // Warm MediaPipe while ffmpeg extracts frames.
       if (!MediaPipePoseEstimationService.isInitialized()) {
@@ -76,16 +80,31 @@ export class PoseController {
         : MediaPipePoseEstimationService.initialize();
 
       // Extract frames
-      console.log(`Extracting frames at ${config.frameSampleIntervalMs}ms intervals`);
+      const effectiveSampleIntervalMs = this.getEffectiveSampleIntervalMs(videoInfo.durationMs);
+      const expectedFrameCount = Math.ceil(videoInfo.durationMs / effectiveSampleIntervalMs);
+      console.log(
+        `Extracting ~${expectedFrameCount} ${config.extractedFrameFormat.toUpperCase()} frames ` +
+        `at ${effectiveSampleIntervalMs}ms intervals, max width ${config.extractedFrameMaxWidth}px`
+      );
+      const extractionStartedAt = Date.now();
       const extractedFrames = await FrameExtractionService.extractFrames(uploadedVideoPath, {
-        sampleIntervalMs: config.frameSampleIntervalMs,
+        sampleIntervalMs: effectiveSampleIntervalMs,
         outputDir: frameExtractionDir,
+        frameFormat: config.extractedFrameFormat,
+        maxWidth: config.extractedFrameMaxWidth,
+        jpegQuality: config.extractedFrameJpegQuality,
+        videoInfo,
       });
 
-      console.log(`Extracted ${extractedFrames.length} frames`);
+      console.log(`Extracted ${extractedFrames.length} frames in ${Date.now() - extractionStartedAt}ms`);
 
       // Wait for MediaPipe if frame extraction finished first.
+      const mediaPipeWaitStartedAt = Date.now();
       await mediaPipeReady;
+      const mediaPipeWaitMs = Date.now() - mediaPipeWaitStartedAt;
+      if (mediaPipeWaitMs > 0) {
+        console.log(`MediaPipe wait after extraction: ${mediaPipeWaitMs}ms`);
+      }
 
       // Process each frame
       const frameDataList: FrameData[] = [];
@@ -103,6 +122,7 @@ export class PoseController {
       );
       console.log(`Pose estimation completed in ${Date.now() - poseEstimationStartedAt}ms`);
 
+      const angleCalculationStartedAt = Date.now();
       for (const frameData of estimatedFrames) {
         // Calculate angles
         const angleOptions: AngleCalculationOptions = {
@@ -122,6 +142,7 @@ export class PoseController {
 
         frameDataList.push(frameData);
       }
+      console.log(`Angle and quality pass completed in ${Date.now() - angleCalculationStartedAt}ms`);
 
       // Calculate quality metrics
       const personDetected = frameDataList.some((f) => Object.keys(f.landmarks).length > 0);
@@ -166,7 +187,7 @@ export class PoseController {
         durationMs: videoInfo.durationMs,
         totalFramesInVideo: videoInfo.totalFramesEstimated,
         sampledFrameCount: frameDataList.length,
-        frameSamplingRate: `every ${config.frameSampleIntervalMs}ms`,
+        frameSamplingRate: `every ${effectiveSampleIntervalMs}ms`,
       };
 
       const sourceModel: SourceModel = {
@@ -196,8 +217,14 @@ export class PoseController {
         const evaluationStartedAt = Date.now();
         const evaluation = await LlmExerciseEvaluationService.evaluate(exerciseType!, movementSummary);
         console.log(`Groq evaluation completed in ${Date.now() - evaluationStartedAt}ms`);
+        const includePoseAnalysis = req.query.includePoseAnalysis !== 'false';
+        const includeFrames = req.query.includeFrames !== 'false';
+        const poseAnalysis = includeFrames
+          ? response
+          : this.withoutFrameDetails(response);
+        console.log(`Analyze request completed in ${Date.now() - requestStartedAt}ms`);
         res.status(200).json({
-          poseAnalysis: response,
+          ...(includePoseAnalysis ? { poseAnalysis } : {}),
           movementSummary,
           evaluation,
         });
@@ -208,6 +235,13 @@ export class PoseController {
         response.summary = MovementSummaryService.summarize(response, exerciseType);
       }
 
+      if (req.query.includeFrames === 'false') {
+        console.log(`Analyze request completed in ${Date.now() - requestStartedAt}ms`);
+        res.status(200).json(this.withoutFrameDetails(response));
+        return;
+      }
+
+      console.log(`Analyze request completed in ${Date.now() - requestStartedAt}ms`);
       res.status(200).json(response);
     } catch (error) {
       console.error('Error analyzing video:', error);
@@ -322,5 +356,29 @@ export class PoseController {
       service: 'Exercise Pose Estimation API',
       mediapipeInitialized: MediaPipePoseEstimationService.isInitialized(),
     });
+  }
+
+  private static getEffectiveSampleIntervalMs(durationMs: number): number {
+    const maxFrames = config.maxAnalysisFrames;
+    if (!Number.isFinite(maxFrames) || maxFrames <= 0 || durationMs <= 0) {
+      return config.frameSampleIntervalMs;
+    }
+
+    const intervalForFrameCap = Math.ceil(durationMs / maxFrames);
+    return Math.max(config.frameSampleIntervalMs, intervalForFrameCap);
+  }
+
+  private static withoutFrameDetails(response: PoseAnalysisResponse): PoseAnalysisResponse {
+    return {
+      ...response,
+      frames: [],
+      quality: {
+        ...response.quality,
+        warnings: [
+          ...response.quality.warnings,
+          'Frame details omitted because includeFrames=false',
+        ],
+      },
+    };
   }
 }
